@@ -38,6 +38,38 @@ ask_yes_no() {
     done
 }
 
+# ***** 核心转换函数：子网掩码 (255.255.255.0) 转换为 CIDR (/24) *****
+mask_to_cidr() {
+    local mask=$1
+    local cidr=0
+    # 使用 bc 和 tr 将点分十进制转换为二进制并计数 '1'
+    for octet in $(echo $mask | tr '.' ' '); do
+        # 必须确保 bc 可用
+        if ! command -v bc &> /dev/null; then
+            echo "BC_MISSING"
+            return
+        fi
+
+        # 转换为二进制并去除 leading 0s
+        # 注意: 某些 bc 版本可能需要更复杂的填充
+        binary_octet=$(echo "obase=2;$octet" | bc)
+
+        # 确保每个八位字节都有 8 位，并统计 '1' 的数量
+        # 简单地统计字符串中的 '1's
+        # 确保掩码是连续的 1，不连续的掩码会被计入但配置 Netplan 会失败，这里只做格式转换。
+        ones=$(echo "$binary_octet" | tr -d '0' | wc -c)
+        cidr=$((cidr + ones))
+    done
+
+    # 简单的有效性检查 (掩码长度在 8 到 32 之间)
+    if [[ $cidr -lt 8 || $cidr -gt 32 ]]; then
+        echo "ERROR"
+    else
+        echo "/$cidr"
+    fi
+}
+# *******************************************************************
+
 echo -e "${GREEN}=== Ubuntu 24.04 Server 初始化脚本 (最终修复版) ===${NC}"
 echo -e "当前操作目标用户: ${YELLOW}$REAL_USER${NC}"
 
@@ -54,28 +86,36 @@ echo -e "${YELLOW}--------------------------------------------------${NC}"
 
 # 收集信息
 read -p "请输入要配置的网卡名称 (如 enp1s0): " IFACE
-# 检查网卡是否存在
 if ! ip link show "$IFACE" > /dev/null 2>&1; then
     echo -e "${RED}错误: 网卡 $IFACE 不存在，脚本退出。${NC}"
     exit 1
 fi
 
-read -p "请输入静态 IP (CIDR格式, 务必包含 /掩码, 如 192.168.100.10/24): " IP_ADDR
+read -p "请输入 IP 地址 (不含掩码, 如 192.168.100.10): " IP_ONLY
+read -p "请输入 子网掩码 (默认 255.255.255.0, 可直接回车): " SUBNET_MASK
 read -p "请输入 网关 IP (如 192.168.100.1): " GATEWAY
 read -p "请输入 DNS (如 192.168.100.1): " DNS_SERVER
 
-# ****** 关键修复点：检查和修正 CIDR 格式 ******
-if [[ ! "$IP_ADDR" =~ / ]]; then
-    read -p "$(echo -e "${YELLOW}警告: 您输入的 IP '$IP_ADDR' 缺少子网掩码。是否默认使用 /24 ? (建议选 y)${NC} [y/n]: ")" use_default_mask
-    if [[ "$use_default_mask" =~ ^[Yy]$ ]]; then
-        IP_ADDR="$IP_ADDR/24"
-        echo -e "${GREEN}IP 地址已自动修正为: $IP_ADDR${NC}"
-    else
-        echo -e "${RED}IP 地址格式不完整，请重新运行脚本并输入完整的 CIDR 格式。${NC}"
-        exit 1
-    fi
+# 默认掩码处理
+if [ -z "$SUBNET_MASK" ]; then
+    SUBNET_MASK="255.255.255.0"
+    echo -e "${YELLOW}使用默认子网掩码: $SUBNET_MASK${NC}"
 fi
-# **********************************************
+
+# 转换掩码
+CIDR_PREFIX=$(mask_to_cidr "$SUBNET_MASK")
+
+if [ "$CIDR_PREFIX" == "ERROR" ]; then
+    echo -e "${RED}错误: 子网掩码格式 '$SUBNET_MASK' 无效或无法转换。请检查输入。${NC}"
+    exit 1
+fi
+if [ "$CIDR_PREFIX" == "BC_MISSING" ]; then
+    echo -e "${RED}错误: 缺少 'bc' 命令，无法进行子网掩码转换。请安装 bc (sudo apt install bc) 或手动输入 CIDR 格式。${NC}"
+    exit 1
+fi
+
+FINAL_IP_ADDR="${IP_ONLY}${CIDR_PREFIX}"
+echo -e "${GREEN}Netplan 使用的最终 IP 地址格式: $FINAL_IP_ADDR${NC}"
 
 # 在当前目录生成配置文件
 echo -e "\n正在当前目录生成 ${LOCAL_NETPLAN_FILE} ..."
@@ -86,7 +126,7 @@ network:
     $IFACE:
       dhcp4: no
       addresses:
-        - $IP_ADDR
+        - $FINAL_IP_ADDR
       routes:
         - to: default
           via: $GATEWAY
