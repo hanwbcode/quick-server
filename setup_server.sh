@@ -18,7 +18,7 @@ PUB_KEY_FILE="./id_ed25519.pub"
 
 # 检查是否以 sudo 运行
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}请使用 sudo 运行此脚本: sudo ./setup_server_v2.sh${NC}"
+  echo -e "${RED}请使用 sudo 运行此脚本: sudo ./setup_server_final.sh${NC}"
   exit 1
 fi
 
@@ -38,31 +38,44 @@ ask_yes_no() {
     done
 }
 
-echo -e "${GREEN}=== Ubuntu 24.04 Server 初始化脚本 (升级版) ===${NC}"
+echo -e "${GREEN}=== Ubuntu 24.04 Server 初始化脚本 (最终修复版) ===${NC}"
 echo -e "当前操作目标用户: ${YELLOW}$REAL_USER${NC}"
 
-# ==========================================
+# ------------------------------------------------------------------
 # 1. 网络配置 (Netplan)
-# ==========================================
+# ------------------------------------------------------------------
 echo -e "\n${BLUE}### 步骤 1: 网络配置 ###${NC}"
 
-# 显示网卡和当前 IP (使用 ip -br addr show 获取简报)
+# 显示网卡和当前 IP
 echo -e "当前网卡及 IP 信息:"
 echo -e "${YELLOW}--------------------------------------------------${NC}"
 ip -c -br addr show | grep -v "lo"
 echo -e "${YELLOW}--------------------------------------------------${NC}"
 
 # 收集信息
-read -p "请输入要配置的网卡名称 (如 ens16f0): " IFACE
+read -p "请输入要配置的网卡名称 (如 enp1s0): " IFACE
 # 检查网卡是否存在
 if ! ip link show "$IFACE" > /dev/null 2>&1; then
     echo -e "${RED}错误: 网卡 $IFACE 不存在，脚本退出。${NC}"
     exit 1
 fi
 
-read -p "请输入静态 IP (CIDR格式, 如 192.168.110.239/24): " IP_ADDR
-read -p "请输入 网关 IP (如 192.168.110.1): " GATEWAY
-read -p "请输入 DNS (如 192.168.110.1): " DNS_SERVER
+read -p "请输入静态 IP (CIDR格式, 务必包含 /掩码, 如 192.168.100.10/24): " IP_ADDR
+read -p "请输入 网关 IP (如 192.168.100.1): " GATEWAY
+read -p "请输入 DNS (如 192.168.100.1): " DNS_SERVER
+
+# ****** 关键修复点：检查和修正 CIDR 格式 ******
+if [[ ! "$IP_ADDR" =~ / ]]; then
+    read -p "$(echo -e "${YELLOW}警告: 您输入的 IP '$IP_ADDR' 缺少子网掩码。是否默认使用 /24 ? (建议选 y)${NC} [y/n]: ")" use_default_mask
+    if [[ "$use_default_mask" =~ ^[Yy]$ ]]; then
+        IP_ADDR="$IP_ADDR/24"
+        echo -e "${GREEN}IP 地址已自动修正为: $IP_ADDR${NC}"
+    else
+        echo -e "${RED}IP 地址格式不完整，请重新运行脚本并输入完整的 CIDR 格式。${NC}"
+        exit 1
+    fi
+fi
+# **********************************************
 
 # 在当前目录生成配置文件
 echo -e "\n正在当前目录生成 ${LOCAL_NETPLAN_FILE} ..."
@@ -105,15 +118,15 @@ if ask_yes_no "是否要用此文件替换系统的 $SYS_NETPLAN_FILE 并应用�
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}网络配置应用成功!${NC}"
     else
-        echo -e "${RED}警告: netplan apply 返回错误，请检查配置。${NC}"
+        echo -e "${RED}警告: netplan apply 失败，请检查配置。${NC}"
     fi
 else
     echo "跳过网络配置应用。"
 fi
 
-# ==========================================
+# ------------------------------------------------------------------
 # 2. SSH 密钥配置
-# ==========================================
+# ------------------------------------------------------------------
 echo -e "\n${BLUE}### 步骤 2: SSH 密钥配置 ###${NC}"
 
 if [ -f "$PUB_KEY_FILE" ]; then
@@ -124,7 +137,6 @@ if [ -f "$PUB_KEY_FILE" ]; then
 
         mkdir -p "$SSH_DIR"
 
-        # 询问是追加还是覆盖
         if [ -f "$AUTH_KEYS" ]; then
              echo "authorized_keys 文件已存在。"
              read -p "选择操作: [A]追加 (Append) / [O]覆盖 (Overwrite) / [S]跳过: " key_op
@@ -153,34 +165,29 @@ else
     echo -e "${YELLOW}未在当前目录找到 $PUB_KEY_FILE，跳过密钥导入。${NC}"
 fi
 
-# ==========================================
+# ------------------------------------------------------------------
 # 3. SSHD 服务配置 (交互式)
-# ==========================================
+# ------------------------------------------------------------------
 echo -e "\n${BLUE}### 步骤 3: SSH 服务安全设置 ###${NC}"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 NEED_RESTART=0
 
-# --- 询问是否开启 SSH 服务 ---
+# 询问是否开启 SSH 服务
 if ask_yes_no "是否确保 SSH 服务已开启并设置为开机自启?"; then
     systemctl enable ssh
     systemctl start ssh
     echo -e "${GREEN}SSH 服务已启用。${NC}"
 fi
 
-# --- 备份配置文件 ---
+# 备份配置文件
 cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%F_%T)"
 
-# --- 询问是否开启 密钥登录 ---
+# 询问是否开启 密钥登录
 if ask_yes_no "是否允许 SSH 密钥登录 (PubkeyAuthentication)?"; then
-    if grep -q "^#\?PubkeyAuthentication" "$SSHD_CONFIG"; then
-        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
-    else
-        echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
-    fi
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
     echo " -> 已设置: PubkeyAuthentication yes"
     NEED_RESTART=1
 else
-    # 如果用户选择否，询问是否要显式关闭
     if ask_yes_no "  -> 是否要显式关闭密钥登录?"; then
         sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/' "$SSHD_CONFIG"
         echo " -> 已设置: PubkeyAuthentication no"
@@ -188,28 +195,19 @@ else
     fi
 fi
 
-# --- 询问是否开启 密码登录 ---
-# 注意：通常为了安全是选择“关闭”，这里逻辑是询问是否“开启”，选n则为关闭
+# 询问是否开启 密码登录
 if ask_yes_no "是否允许 SSH 密码登录 (PasswordAuthentication)?"; then
-    if grep -q "^#\?PasswordAuthentication" "$SSHD_CONFIG"; then
-        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
-    else
-        echo "PasswordAuthentication yes" >> "$SSHD_CONFIG"
-    fi
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
     echo " -> 已设置: PasswordAuthentication yes"
     NEED_RESTART=1
 else
     echo -e "${YELLOW}正在关闭密码登录...${NC}"
-    if grep -q "^#\?PasswordAuthentication" "$SSHD_CONFIG"; then
-        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
-    else
-        echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
-    fi
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
     echo " -> 已设置: PasswordAuthentication no"
     NEED_RESTART=1
 fi
 
-# --- 应用更改 ---
+# 应用更改
 if [ $NEED_RESTART -eq 1 ]; then
     echo -e "\n正在检查 SSHD 配置语法..."
     sshd -t
@@ -224,4 +222,4 @@ else
     echo "SSH 配置未发生变更。"
 fi
 
-echo -e "\n${GREEN}=== 所有操作已完成 ===${NC}"
+echo -e "\n${GREEN}=== 所有配置操作已完成 ===${NC}"
